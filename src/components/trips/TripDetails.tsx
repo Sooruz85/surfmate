@@ -1,48 +1,121 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Trip, Spot, User, TripRequest, Message } from '@/types'
 import { supabase } from '@/lib/supabase/client'
-import { format } from 'date-fns'
-import { fr } from 'date-fns/locale'
 import { useRouter } from 'next/navigation'
+import { Trip, TripRequest, Message } from '@/types'
 
-type TripDetailsProps = {
-  trip: Trip & {
-    spot: Spot
-    creator: User
-  }
+interface TripDetailsProps {
+  tripId: string
 }
 
-export default function TripDetails({ trip }: TripDetailsProps) {
+export default function TripDetails({ tripId }: TripDetailsProps) {
   const router = useRouter()
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [trip, setTrip] = useState<Trip | null>(null)
+  const [requests, setRequests] = useState<TripRequest[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [newMessage, setNewMessage] = useState('')
-  const [user, setUser] = useState<User | null>(null)
-  const [tripRequest, setTripRequest] = useState<TripRequest | null>(null)
+  const [currentUser, setCurrentUser] = useState<string | null>(null)
 
   useEffect(() => {
-    const fetchUser = async () => {
+    const fetchCurrentUser = async () => {
       const { data: { user } } = await supabase.auth.getUser()
-      if (user) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', user.id)
-          .single()
-        setUser(profile)
+      setCurrentUser(user?.id || null)
+    }
+    fetchCurrentUser()
+  }, [])
+
+  useEffect(() => {
+    const fetchTrip = async () => {
+      const { data, error } = await supabase
+        .from('trips')
+        .select(`
+          *,
+          spots (
+            name,
+            location,
+            description
+          ),
+          profiles:creator_id (
+            full_name
+          )
+        `)
+        .eq('id', tripId)
+        .single()
+
+      if (error) {
+        console.error('Erreur lors de la récupération du trajet:', error)
+        setError('Une erreur est survenue lors de la récupération du trajet.')
+        setLoading(false)
+        return
       }
+
+      setTrip(data)
+      setLoading(false)
     }
 
+    fetchTrip()
+
+    const subscription = supabase
+      .channel('trip_changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'trips', filter: `id=eq.${tripId}` }, () => {
+        fetchTrip()
+      })
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [tripId])
+
+  useEffect(() => {
+    const fetchRequests = async () => {
+      const { data, error } = await supabase
+        .from('trip_requests')
+        .select(`
+          *,
+          profiles (
+            full_name
+          )
+        `)
+        .eq('trip_id', tripId)
+        .order('created_at', { ascending: false })
+
+      if (error) {
+        console.error('Erreur lors de la récupération des demandes:', error)
+        return
+      }
+
+      setRequests(data || [])
+    }
+
+    fetchRequests()
+
+    const subscription = supabase
+      .channel('trip_requests_changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'trip_requests', filter: `trip_id=eq.${tripId}` }, () => {
+        fetchRequests()
+      })
+      .subscribe()
+
+    return () => {
+      subscription.unsubscribe()
+    }
+  }, [tripId])
+
+  useEffect(() => {
     const fetchMessages = async () => {
       const { data, error } = await supabase
         .from('messages')
         .select(`
           *,
-          user:profiles(*)
+          profiles (
+            full_name
+          )
         `)
-        .eq('trip_id', trip.id)
+        .eq('trip_id', tripId)
         .order('created_at', { ascending: true })
 
       if (error) {
@@ -53,230 +126,279 @@ export default function TripDetails({ trip }: TripDetailsProps) {
       setMessages(data || [])
     }
 
-    const fetchTripRequest = async () => {
-      if (!user) return
-
-      const { data, error } = await supabase
-        .from('trip_requests')
-        .select('*')
-        .eq('trip_id', trip.id)
-        .eq('user_id', user.id)
-        .single()
-
-      if (error && error.code !== 'PGRST116') {
-        console.error('Erreur lors de la récupération de la demande:', error)
-        return
-      }
-
-      setTripRequest(data)
-    }
-
-    fetchUser()
     fetchMessages()
-    fetchTripRequest()
 
-    // Abonnement aux nouveaux messages
     const subscription = supabase
-      .channel(`messages:${trip.id}`)
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'messages',
-        filter: `trip_id=eq.${trip.id}`,
-      }, (payload) => {
-        setMessages(prev => [...prev, payload.new as Message])
+      .channel('messages_changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages', filter: `trip_id=eq.${tripId}` }, () => {
+        fetchMessages()
       })
       .subscribe()
 
     return () => {
       subscription.unsubscribe()
     }
-  }, [trip.id, user])
+  }, [tripId])
+
+  const handleRequestJoin = async () => {
+    if (!currentUser) {
+      router.push('/login')
+      return
+    }
+
+    const { error: requestError } = await supabase
+      .from('trip_requests')
+      .insert([
+        {
+          trip_id: tripId,
+          user_id: currentUser,
+          status: 'pending'
+        }
+      ])
+
+    if (requestError) {
+      console.error('Erreur lors de la création de la demande:', requestError)
+      setError('Une erreur est survenue lors de la création de la demande.')
+    }
+  }
+
+  const handleRequestResponse = async (requestId: string, status: 'accepted' | 'rejected') => {
+    const { error: updateError } = await supabase
+      .from('trip_requests')
+      .update({ status })
+      .eq('id', requestId)
+
+    if (updateError) {
+      console.error('Erreur lors de la mise à jour de la demande:', updateError)
+      setError('Une erreur est survenue lors de la mise à jour de la demande.')
+      return
+    }
+
+    if (status === 'accepted') {
+      const { error: tripError } = await supabase
+        .from('trips')
+        .update({ available_seats: (trip?.available_seats || 0) - 1 })
+        .eq('id', tripId)
+
+      if (tripError) {
+        console.error('Erreur lors de la mise à jour du trajet:', tripError)
+        setError('Une erreur est survenue lors de la mise à jour du trajet.')
+      }
+    }
+  }
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newMessage.trim() || !user) return
+    if (!currentUser || !newMessage.trim()) return
 
-    const { error } = await supabase
+    const { error: messageError } = await supabase
       .from('messages')
       .insert([
         {
-          trip_id: trip.id,
-          user_id: user.id,
+          trip_id: tripId,
+          user_id: currentUser,
           content: newMessage.trim()
         }
       ])
 
-    if (error) {
-      console.error('Erreur lors de l\'envoi du message:', error)
+    if (messageError) {
+      console.error('Erreur lors de l\'envoi du message:', messageError)
+      setError('Une erreur est survenue lors de l\'envoi du message.')
       return
     }
 
     setNewMessage('')
   }
 
-  const handleRequestTrip = async () => {
-    if (!user) return
-    setLoading(true)
-
-    try {
-      const { error } = await supabase
-        .from('trip_requests')
-        .insert([
-          {
-            trip_id: trip.id,
-            user_id: user.id,
-            status: 'pending'
-          }
-        ])
-
-      if (error) throw error
-
-      router.refresh()
-    } catch (error) {
-      console.error('Erreur lors de la demande de trajet:', error)
-      alert('Une erreur est survenue lors de la demande de trajet')
-    } finally {
-      setLoading(false)
-    }
+  if (loading) {
+    return (
+      <div className="text-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+      </div>
+    )
   }
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case 'open':
-        return 'bg-green-100 text-green-800'
-      case 'full':
-        return 'bg-yellow-100 text-yellow-800'
-      case 'completed':
-        return 'bg-gray-100 text-gray-800'
-      case 'cancelled':
-        return 'bg-red-100 text-red-800'
-      default:
-        return 'bg-gray-100 text-gray-800'
-    }
+  if (error) {
+    return (
+      <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md">
+        {error}
+      </div>
+    )
   }
 
-  const getStatusText = (status: string) => {
-    switch (status) {
-      case 'open':
-        return 'Places disponibles'
-      case 'full':
-        return 'Complet'
-      case 'completed':
-        return 'Terminé'
-      case 'cancelled':
-        return 'Annulé'
-      default:
-        return status
-    }
+  if (!trip) {
+    return null
   }
+
+  const isCreator = currentUser === trip.creator_id
+  const hasPendingRequest = requests.some(
+    request => request.user_id === currentUser && request.status === 'pending'
+  )
 
   return (
     <div className="space-y-6">
-      <div className="bg-white shadow rounded-lg p-6">
-        <div className="flex justify-between items-start mb-4">
-          <div>
-            <h2 className="text-2xl font-bold text-gray-900">{trip.spot.name}</h2>
-            <p className="text-sm text-gray-500">Organisé par {trip.creator.full_name}</p>
-          </div>
-          <span className={`px-2 py-1 text-xs font-medium rounded-full ${getStatusColor(trip.status)}`}>
-            {getStatusText(trip.status)}
+      <div className="flex justify-between items-start">
+        <div>
+          <h2 className="text-2xl font-bold text-gray-900">{trip.spots?.name}</h2>
+          <p className="mt-1 text-sm text-gray-500">{trip.spots?.location}</p>
+        </div>
+        <div className="flex space-x-4">
+          <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+            trip.status === 'open' ? 'bg-green-100 text-green-800' :
+            trip.status === 'closed' ? 'bg-red-100 text-red-800' :
+            'bg-yellow-100 text-yellow-800'
+          }`}>
+            {trip.status === 'open' ? 'Ouvert' :
+             trip.status === 'closed' ? 'Fermé' :
+             'En cours'}
+          </span>
+          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
+            {trip.available_seats} places
           </span>
         </div>
-
-        <div className="space-y-3">
-          <div className="flex items-center text-gray-600">
-            <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
-            </svg>
-            <span>{trip.departure_point.address}</span>
-          </div>
-
-          <div className="flex items-center text-gray-600">
-            <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-            <span>
-              {format(new Date(trip.departure_time), 'EEEE d MMMM yyyy à HH:mm', { locale: fr })}
-            </span>
-          </div>
-
-          <div className="flex items-center text-gray-600">
-            <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-            <span>{trip.available_seats} place{trip.available_seats > 1 ? 's' : ''} disponible{trip.available_seats > 1 ? 's' : ''}</span>
-          </div>
-
-          {trip.difficulty_level && (
-            <div className="flex items-center text-gray-600">
-              <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-              <span>Niveau {trip.difficulty_level}</span>
-            </div>
-          )}
-        </div>
-
-        {user && user.id !== trip.creator_id && trip.status === 'open' && !tripRequest && (
-          <div className="mt-6">
-            <button
-              onClick={handleRequestTrip}
-              disabled={loading}
-              className="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50"
-            >
-              {loading ? 'Envoi de la demande...' : 'Demander à rejoindre le trajet'}
-            </button>
-          </div>
-        )}
-
-        {tripRequest && (
-          <div className="mt-6 p-4 bg-yellow-50 rounded-md">
-            <p className="text-yellow-800">
-              Votre demande est en attente de confirmation
-            </p>
-          </div>
-        )}
       </div>
 
-      <div className="bg-white shadow rounded-lg p-6">
-        <h3 className="text-lg font-semibold text-gray-900 mb-4">Messages</h3>
-
-        <div className="space-y-4 mb-6">
-          {messages.map((message) => (
-            <div key={message.id} className="flex items-start space-x-3">
-              <div className="flex-1">
-                <div className="flex items-center space-x-2">
-                  <span className="font-medium text-gray-900">
-                    {(message as any).user.full_name}
-                  </span>
-                  <span className="text-sm text-gray-500">
-                    {format(new Date(message.created_at), 'HH:mm', { locale: fr })}
-                  </span>
-                </div>
-                <p className="text-gray-600 mt-1">{message.content}</p>
-              </div>
-            </div>
-          ))}
+      <div className="bg-white shadow overflow-hidden sm:rounded-lg">
+        <div className="px-4 py-5 sm:px-6">
+          <h3 className="text-lg leading-6 font-medium text-gray-900">
+            Informations du trajet
+          </h3>
         </div>
+        <div className="border-t border-gray-200">
+          <dl>
+            <div className="bg-gray-50 px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
+              <dt className="text-sm font-medium text-gray-500">Organisateur</dt>
+              <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
+                {trip.profiles?.full_name}
+              </dd>
+            </div>
+            <div className="bg-white px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
+              <dt className="text-sm font-medium text-gray-500">Date et heure</dt>
+              <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
+                {new Date(trip.departure_time).toLocaleString('fr-FR')}
+              </dd>
+            </div>
+            <div className="bg-gray-50 px-4 py-5 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-6">
+              <dt className="text-sm font-medium text-gray-500">Description du spot</dt>
+              <dd className="mt-1 text-sm text-gray-900 sm:mt-0 sm:col-span-2">
+                {trip.spots?.description}
+              </dd>
+            </div>
+          </dl>
+        </div>
+      </div>
 
-        <form onSubmit={handleSendMessage} className="flex space-x-4">
-          <input
-            type="text"
-            value={newMessage}
-            onChange={(e) => setNewMessage(e.target.value)}
-            placeholder="Écrivez votre message..."
-            className="flex-1 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
-          />
+      {!isCreator && trip.status === 'open' && !hasPendingRequest && (
+        <div className="flex justify-center">
           <button
-            type="submit"
-            disabled={!newMessage.trim()}
-            className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50"
+            onClick={handleRequestJoin}
+            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
           >
-            Envoyer
+            Demander à rejoindre
           </button>
-        </form>
+        </div>
+      )}
+
+      {isCreator && requests.length > 0 && (
+        <div className="bg-white shadow overflow-hidden sm:rounded-lg">
+          <div className="px-4 py-5 sm:px-6">
+            <h3 className="text-lg leading-6 font-medium text-gray-900">
+              Demandes de participation
+            </h3>
+          </div>
+          <div className="border-t border-gray-200">
+            <ul className="divide-y divide-gray-200">
+              {requests.map((request) => (
+                <li key={request.id} className="px-4 py-4 sm:px-6">
+                  <div className="flex items-center justify-between">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        {request.profiles?.full_name}
+                      </p>
+                      <p className="mt-1 text-sm text-gray-500">
+                        {new Date(request.created_at).toLocaleString('fr-FR')}
+                      </p>
+                    </div>
+                    {request.status === 'pending' && (
+                      <div className="ml-4 flex-shrink-0 flex space-x-4">
+                        <button
+                          onClick={() => handleRequestResponse(request.id, 'accepted')}
+                          className="text-green-600 hover:text-green-900"
+                        >
+                          Accepter
+                        </button>
+                        <button
+                          onClick={() => handleRequestResponse(request.id, 'rejected')}
+                          className="text-red-600 hover:text-red-900"
+                        >
+                          Refuser
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <div className="bg-white shadow overflow-hidden sm:rounded-lg">
+        <div className="px-4 py-5 sm:px-6">
+          <h3 className="text-lg leading-6 font-medium text-gray-900">
+            Messages
+          </h3>
+        </div>
+        <div className="border-t border-gray-200">
+          <div className="px-4 py-4 sm:px-6">
+            <div className="space-y-4">
+              {messages.map((message) => (
+                <div key={message.id} className="flex space-x-3">
+                  <div className="flex-1">
+                    <div className="flex items-center">
+                      <p className="text-sm font-medium text-gray-900">
+                        {message.profiles?.full_name}
+                      </p>
+                      <p className="ml-2 text-sm text-gray-500">
+                        {new Date(message.created_at).toLocaleString('fr-FR')}
+                      </p>
+                    </div>
+                    <p className="mt-1 text-sm text-gray-700">
+                      {message.content}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="px-4 py-4 sm:px-6 border-t border-gray-200">
+            <form onSubmit={handleSendMessage} className="flex space-x-4">
+              <input
+                type="text"
+                value={newMessage}
+                onChange={(e) => setNewMessage(e.target.value)}
+                placeholder="Écrivez votre message..."
+                className="flex-1 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+              />
+              <button
+                type="submit"
+                disabled={!newMessage.trim()}
+                className="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
+              >
+                Envoyer
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex justify-end">
+        <button
+          onClick={() => router.push('/trips')}
+          className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+        >
+          Retour à la liste
+        </button>
       </div>
     </div>
   )

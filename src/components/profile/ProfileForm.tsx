@@ -1,20 +1,28 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { User } from '@/types'
 import { supabase } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
+import { User } from '@/types'
 
 export default function ProfileForm() {
   const router = useRouter()
-  const [loading, setLoading] = useState(false)
-  const [profile, setProfile] = useState<User | null>(null)
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [profile, setProfile] = useState<Partial<User>>({
+    full_name: '',
+    avatar_url: ''
+  })
+  const [avatarFile, setAvatarFile] = useState<File | null>(null)
 
   useEffect(() => {
     const fetchProfile = async () => {
       const { data: { user } } = await supabase.auth.getUser()
-      if (!user) return
+      if (!user) {
+        router.push('/login')
+        return
+      }
 
       const { data, error } = await supabase
         .from('profiles')
@@ -24,23 +32,54 @@ export default function ProfileForm() {
 
       if (error) {
         console.error('Erreur lors de la récupération du profil:', error)
+        setError('Une erreur est survenue lors de la récupération du profil.')
+        setLoading(false)
         return
       }
 
       setProfile(data)
-      setAvatarUrl(data.avatar_url)
+      setLoading(false)
     }
 
     fetchProfile()
-  }, [])
+  }, [router])
+
+  const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) {
+      setAvatarFile(file)
+    }
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!profile) return
-    setLoading(true)
+    setSaving(true)
+    setError(null)
 
     try {
-      const { error } = await supabase
+      let avatarUrl = profile.avatar_url
+
+      if (avatarFile) {
+        const fileExt = avatarFile.name.split('.').pop()
+        const fileName = `${Math.random()}.${fileExt}`
+        const filePath = `avatars/${fileName}`
+
+        const { error: uploadError } = await supabase.storage
+          .from('avatars')
+          .upload(filePath, avatarFile)
+
+        if (uploadError) {
+          throw uploadError
+        }
+
+        const { data: { publicUrl } } = supabase.storage
+          .from('avatars')
+          .getPublicUrl(filePath)
+
+        avatarUrl = publicUrl
+      }
+
+      const { error: updateError } = await supabase
         .from('profiles')
         .update({
           full_name: profile.full_name,
@@ -48,52 +87,20 @@ export default function ProfileForm() {
         })
         .eq('id', profile.id)
 
-      if (error) throw error
+      if (updateError) {
+        throw updateError
+      }
 
       router.refresh()
     } catch (error) {
       console.error('Erreur lors de la mise à jour du profil:', error)
-      alert('Une erreur est survenue lors de la mise à jour du profil')
+      setError('Une erreur est survenue lors de la mise à jour du profil.')
     } finally {
-      setLoading(false)
+      setSaving(false)
     }
   }
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    try {
-      setLoading(true)
-
-      if (!e.target.files || e.target.files.length === 0) {
-        throw new Error('Vous devez sélectionner une image')
-      }
-
-      const file = e.target.files[0]
-      const fileExt = file.name.split('.').pop()
-      const fileName = `${Math.random()}.${fileExt}`
-      const filePath = `${fileName}`
-
-      const { error: uploadError } = await supabase.storage
-        .from('avatars')
-        .upload(filePath, file)
-
-      if (uploadError) {
-        throw uploadError
-      }
-
-      const { data: { publicUrl } } = supabase.storage
-        .from('avatars')
-        .getPublicUrl(filePath)
-
-      setAvatarUrl(publicUrl)
-    } catch (error) {
-      console.error('Erreur lors du téléchargement de l\'avatar:', error)
-      alert('Une erreur est survenue lors du téléchargement de l\'avatar')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  if (!profile) {
+  if (loading) {
     return (
       <div className="text-center">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
@@ -103,38 +110,35 @@ export default function ProfileForm() {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md">
+          {error}
+        </div>
+      )}
+
       <div>
         <label className="block text-sm font-medium text-gray-700">
           Photo de profil
         </label>
-        <div className="mt-1 flex items-center space-x-4">
-          <div className="relative h-20 w-20">
-            {avatarUrl ? (
-              <img
-                src={avatarUrl}
-                alt="Avatar"
-                className="h-20 w-20 rounded-full object-cover"
-              />
-            ) : (
-              <div className="h-20 w-20 rounded-full bg-gray-200 flex items-center justify-center">
-                <svg className="h-12 w-12 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                </svg>
-              </div>
-            )}
-          </div>
-          <div>
+        <div className="mt-1 flex items-center">
+          <div className="relative">
+            <img
+              src={profile.avatar_url || '/default-avatar.png'}
+              alt="Avatar"
+              className="h-20 w-20 rounded-full object-cover"
+            />
+            <label
+              htmlFor="avatar-upload"
+              className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50 rounded-full cursor-pointer opacity-0 hover:opacity-100 transition-opacity"
+            >
+              <span className="text-white text-sm">Changer</span>
+            </label>
             <input
+              id="avatar-upload"
               type="file"
               accept="image/*"
-              onChange={handleAvatarUpload}
-              disabled={loading}
-              className="block w-full text-sm text-gray-500
-                file:mr-4 file:py-2 file:px-4
-                file:rounded-md file:border-0
-                file:text-sm file:font-semibold
-                file:bg-blue-50 file:text-blue-700
-                hover:file:bg-blue-100"
+              onChange={handleAvatarChange}
+              className="hidden"
             />
           </div>
         </div>
@@ -148,31 +152,19 @@ export default function ProfileForm() {
           type="text"
           id="full_name"
           value={profile.full_name}
-          onChange={(e) => setProfile(prev => prev ? { ...prev, full_name: e.target.value } : null)}
+          onChange={(e) => setProfile({ ...profile, full_name: e.target.value })}
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
-        />
-      </div>
-
-      <div>
-        <label htmlFor="email" className="block text-sm font-medium text-gray-700">
-          Email
-        </label>
-        <input
-          type="email"
-          id="email"
-          value={profile.email}
-          disabled
-          className="mt-1 block w-full rounded-md border-gray-300 bg-gray-50 shadow-sm"
+          required
         />
       </div>
 
       <div className="flex justify-end">
         <button
           type="submit"
-          disabled={loading}
-          className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50"
+          disabled={saving}
+          className="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
         >
-          {loading ? 'Enregistrement...' : 'Enregistrer les modifications'}
+          {saving ? 'Enregistrement...' : 'Enregistrer les modifications'}
         </button>
       </div>
     </form>

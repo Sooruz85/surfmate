@@ -1,25 +1,24 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Spot } from '@/types'
 import { supabase } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
+import { Spot } from '@/types'
 
 export default function CreateTripForm() {
   const router = useRouter()
-  const [spots, setSpots] = useState<Spot[]>([])
   const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [spots, setSpots] = useState<Spot[]>([])
   const [formData, setFormData] = useState({
     spot_id: '',
-    departure_point: {
-      latitude: 0,
-      longitude: 0,
-      address: ''
-    },
     departure_time: '',
     available_seats: 1,
     difficulty_level: '',
-    status: 'open'
+    departure_point: {
+      address: '',
+      coordinates: { lat: 0, lng: 0 }
+    }
   })
 
   useEffect(() => {
@@ -31,6 +30,7 @@ export default function CreateTripForm() {
 
       if (error) {
         console.error('Erreur lors de la récupération des spots:', error)
+        setError('Une erreur est survenue lors de la récupération des spots.')
         return
       }
 
@@ -43,68 +43,61 @@ export default function CreateTripForm() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
+    setError(null)
 
-    try {
-      // Récupérer l'utilisateur connecté
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) throw new Error('Utilisateur non connecté')
-
-      const { error } = await supabase
-        .from('trips')
-        .insert([
-          {
-            ...formData,
-            creator_id: user.id
-          }
-        ])
-
-      if (error) throw error
-
-      router.push('/trips')
-      router.refresh()
-    } catch (error) {
-      console.error('Erreur lors de la création du trajet:', error)
-      alert('Une erreur est survenue lors de la création du trajet')
-    } finally {
-      setLoading(false)
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      router.push('/login')
+      return
     }
-  }
 
-  const handleSpotChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const spotId = e.target.value
-    const selectedSpot = spots.find(spot => spot.id === spotId)
-
-    if (selectedSpot) {
-      setFormData(prev => ({
-        ...prev,
-        spot_id: spotId,
-        departure_point: {
-          latitude: selectedSpot.latitude,
-          longitude: selectedSpot.longitude,
-          address: selectedSpot.name
+    const { error: insertError } = await supabase
+      .from('trips')
+      .insert([
+        {
+          creator_id: user.id,
+          spot_id: formData.spot_id,
+          departure_time: formData.departure_time,
+          available_seats: formData.available_seats,
+          difficulty_level: formData.difficulty_level,
+          departure_point: formData.departure_point,
+          status: 'open'
         }
-      }))
+      ])
+
+    if (insertError) {
+      console.error('Erreur lors de la création du trajet:', insertError)
+      setError('Une erreur est survenue lors de la création du trajet.')
+      setLoading(false)
+      return
     }
+
+    router.push('/trips')
   }
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md">
+          {error}
+        </div>
+      )}
+
       <div>
-        <label htmlFor="spot" className="block text-sm font-medium text-gray-700">
-          Spot de surf
+        <label htmlFor="spot_id" className="block text-sm font-medium text-gray-700">
+          Spot
         </label>
         <select
-          id="spot"
-          name="spot_id"
-          required
+          id="spot_id"
           value={formData.spot_id}
-          onChange={handleSpotChange}
+          onChange={(e) => setFormData({ ...formData, spot_id: e.target.value })}
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+          required
         >
           <option value="">Sélectionnez un spot</option>
           {spots.map((spot) => (
             <option key={spot.id} value={spot.id}>
-              {spot.name}
+              {spot.name} - {spot.location}
             </option>
           ))}
         </select>
@@ -117,11 +110,10 @@ export default function CreateTripForm() {
         <input
           type="datetime-local"
           id="departure_time"
-          name="departure_time"
-          required
           value={formData.departure_time}
-          onChange={(e) => setFormData(prev => ({ ...prev, departure_time: e.target.value }))}
+          onChange={(e) => setFormData({ ...formData, departure_time: e.target.value })}
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+          required
         />
       </div>
 
@@ -132,13 +124,11 @@ export default function CreateTripForm() {
         <input
           type="number"
           id="available_seats"
-          name="available_seats"
           min="1"
-          max="8"
-          required
           value={formData.available_seats}
-          onChange={(e) => setFormData(prev => ({ ...prev, available_seats: parseInt(e.target.value) }))}
+          onChange={(e) => setFormData({ ...formData, available_seats: parseInt(e.target.value) })}
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+          required
         />
       </div>
 
@@ -148,9 +138,8 @@ export default function CreateTripForm() {
         </label>
         <select
           id="difficulty_level"
-          name="difficulty_level"
           value={formData.difficulty_level}
-          onChange={(e) => setFormData(prev => ({ ...prev, difficulty_level: e.target.value }))}
+          onChange={(e) => setFormData({ ...formData, difficulty_level: e.target.value })}
           className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
         >
           <option value="">Sélectionnez un niveau</option>
@@ -160,10 +149,31 @@ export default function CreateTripForm() {
         </select>
       </div>
 
+      <div>
+        <label htmlFor="departure_point" className="block text-sm font-medium text-gray-700">
+          Point de départ
+        </label>
+        <input
+          type="text"
+          id="departure_point"
+          value={formData.departure_point.address}
+          onChange={(e) => setFormData({
+            ...formData,
+            departure_point: {
+              ...formData.departure_point,
+              address: e.target.value
+            }
+          })}
+          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+          placeholder="Adresse du point de départ"
+          required
+        />
+      </div>
+
       <div className="flex justify-end space-x-4">
         <button
           type="button"
-          onClick={() => router.back()}
+          onClick={() => router.push('/trips')}
           className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
         >
           Annuler
